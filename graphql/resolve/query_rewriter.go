@@ -108,11 +108,7 @@ func getAuthSelector(queryType schema.QueryType) func(t schema.Type) *schema.Rul
 	return queryAuthSelector
 }
 
-// Rewrite rewrites a GraphQL query into a Dgraph GraphQuery.
-func (qr *queryRewriter) Rewrite(
-	ctx context.Context,
-	gqlQuery schema.Query) ([]*gql.GraphQuery, error) {
-
+func prepareAuthRewriter(ctx context.Context, gqlQuery schema.Query) (*authRewriter, error) {
 	customClaims, err := gqlQuery.GetAuthMeta().ExtractCustomClaims(ctx)
 	if err != nil {
 		return nil, err
@@ -126,6 +122,19 @@ func (qr *queryRewriter) Rewrite(
 	}
 	authRw.hasAuthRules = hasAuthRules(gqlQuery, authRw)
 	authRw.hasCascade = hasCascadeDirective(gqlQuery)
+
+	return authRw, nil
+}
+
+// Rewrite rewrites a GraphQL query into a Dgraph GraphQuery.
+func (qr *queryRewriter) Rewrite(
+	ctx context.Context,
+	gqlQuery schema.Query) ([]*gql.GraphQuery, error) {
+
+	authRw, err := prepareAuthRewriter(ctx, gqlQuery)
+	if err != nil {
+		return nil, err
+	}
 
 	switch gqlQuery.QueryType() {
 	case schema.GetQuery:
@@ -153,87 +162,9 @@ func (qr *queryRewriter) Rewrite(
 		return passwordQuery(gqlQuery, authRw)
 	case schema.AggregateQuery:
 		return aggregateQuery(gqlQuery, authRw), nil
-	case schema.EntitiesQuery:
-		return entitiesQuery(gqlQuery, authRw)
 	default:
 		return nil, errors.Errorf("unimplemented query type %s", gqlQuery.QueryType())
 	}
-}
-
-// entitiesQuery rewrites the Apollo `_entities` Query which is sent from the Apollo gateway to a DQL query.
-// This query is sent to the Dgraph service to resolve types `extended` and defined by this service.
-func entitiesQuery(field schema.Query, authRw *authRewriter) ([]*gql.GraphQuery, error) {
-
-	// Input Argument to the Query is a List of "__typename" and "keyField" pair.
-	// For this type Extension:-
-	// 	extend type Product @key(fields: "upc") {
-	// 		upc: String @external
-	// 		reviews: [Review]
-	// 	}
-	// Input to the Query will be
-	// "_representations": [
-	// 		{
-	// 		  "__typename": "Product",
-	// 	 	 "upc": "B00005N5PF"
-	// 		},
-	// 		...
-	//   ]
-
-	parsedRepr, err := field.RepresentationsArg()
-	if err != nil {
-		return nil, err
-	}
-
-	typeDefn := parsedRepr.TypeDefn
-	rbac := authRw.evaluateStaticRules(typeDefn)
-
-	dgQuery := &gql.GraphQuery{
-		Attr: field.Name(),
-	}
-
-	if rbac == schema.Negative {
-		dgQuery.Attr = dgQuery.Attr + "()"
-		return []*gql.GraphQuery{dgQuery}, nil
-	}
-
-	// Construct Filter at Root Func.
-	// if keyFieldsIsID = true and keyFieldValueList = {"0x1", "0x2"}
-	// then query will be formed as:-
-	// 	_entities(func: uid("0x1", "0x2") {
-	//		...
-	//	}
-	// if keyFieldsIsID = false then query will be like:-
-	// 	_entities(func: eq(keyFieldName,"0x1", "0x2") {
-	//		...
-	//	}
-
-	// If the key field is of ID type and is not an external field
-	// then we query it using the `uid` otherwise we treat it as string
-	// and query using `eq` function.
-	// We also don't need to add Order to the query as the results are
-	// automatically returned in the ascending order of the uids.
-	if parsedRepr.KeyField.IsID() && !parsedRepr.KeyField.IsExternal() {
-		addUIDFunc(dgQuery, convertIDs(parsedRepr.KeyVals))
-	} else {
-		addEqFunc(dgQuery, typeDefn.DgraphPredicate(parsedRepr.KeyField.Name()), parsedRepr.KeyVals)
-		// Add the  ascending Order of the keyField in the query.
-		// The result will be converted into the exact in the resultCompletion step.
-		dgQuery.Order = append(dgQuery.Order,
-			&pb.Order{Attr: typeDefn.DgraphPredicate(parsedRepr.KeyField.Name())})
-	}
-	// AddTypeFilter in as the Filter to the Root the Query.
-	// Query will be like :-
-	// 	_entities(func: ...) @filter(type(typeName)) {
-	//		...
-	// 	}
-	addTypeFilter(dgQuery, typeDefn)
-
-	selectionAuth := addSelectionSetFrom(dgQuery, field, authRw)
-	addUID(dgQuery)
-
-	dgQueries := authRw.addAuthQueries(typeDefn, []*gql.GraphQuery{dgQuery}, rbac)
-	return append(dgQueries, selectionAuth...), nil
-
 }
 
 func aggregateQuery(query schema.Query, authRw *authRewriter) []*gql.GraphQuery {
